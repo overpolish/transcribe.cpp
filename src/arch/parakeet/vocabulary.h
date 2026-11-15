@@ -131,6 +131,33 @@ struct VocabularyCandidate {
 std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<VocabularyWord> & words,
                                                             const VocabularyBias &              bias);
 
+// A term chosen for a span: the span, and how much better than the heard
+// words it scored.
+struct VocabularyChoice {
+    VocabularyCandidate c;
+    double              gain = 0.0;
+};
+
+// rescore_vocabulary's first half (decoder.cpp): the terms that replace
+// spans of `tokens`, looking only at words that start at or after
+// `from_token`, best first where spans overlap, in token order. Leaves
+// `tokens` alone, so a stream can show its partial result rescored while
+// its decoder carries on from what it heard.
+transcribe_status choose_vocabulary(const HostDecoderWeights &      w,
+                                    const Tokenizer &               tok,
+                                    const VocabularyBias &          bias,
+                                    const DecodeCapture &           capture,
+                                    int                             n_threads,
+                                    const std::vector<TdtToken> &   tokens,
+                                    int                             from_token,
+                                    std::vector<VocabularyChoice> & chosen);
+
+// Its second half: `tokens` with each chosen span replaced by its term's
+// pieces, spread over the span's frames.
+std::vector<TdtToken> apply_vocabulary(const VocabularyBias &                bias,
+                                       const std::vector<TdtToken> &         tokens,
+                                       const std::vector<VocabularyChoice> & chosen);
+
 // Classify a greedy word span covered by a decode-time vocabulary hypothesis:
 //  -1: keep greedy (already written, case-only, inflection, address/path, or
 //      swallows a neighbouring word around a closer inner span)

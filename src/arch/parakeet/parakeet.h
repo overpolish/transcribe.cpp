@@ -334,15 +334,23 @@ struct ParakeetSession final : public transcribe_session {
     // stream_finalize drains the buffer through the inference helper;
     // stream_reset clears (keeping capacity). NOT touched by
     // clear_result (the family owns its per-utterance audio scratch).
-    std::vector<float>    stream_pcm_buffer;
-    transcribe_run_params stream_run_params{};
+    std::vector<float>            stream_pcm_buffer;
+    transcribe_run_params         stream_run_params{};
     // Vocabulary compiled at stream_begin, and the joint encoder
-    // projections retained for rescoring at finalize (bounded; see
-    // stream_capture_sink in model.cpp).
-    VocabularyBias        stream_vocabulary;
-    DecodeCapture         stream_capture;
+    // projections retained for rescoring (bounded; see stream_capture_sink
+    // in model.cpp). A stream rescores as it goes (show_stream_vocabulary):
+    // the spans before stream_vocab_frontier are decided for good, with the
+    // terms chosen for them in stream_vocab_chosen, and stream_shown is
+    // raw_tokens with every term chosen so far, the tokens its partial
+    // result shows. raw_tokens stays as heard, which the decoder goes on
+    // from.
+    VocabularyBias                stream_vocabulary;
+    DecodeCapture                 stream_capture;
+    std::vector<VocabularyChoice> stream_vocab_chosen;
+    int                           stream_vocab_frontier = 0;
+    std::vector<TdtToken>         stream_shown;
     // Convert from cumulative samples so odd feed sizes do not lose fractions.
-    int64_t               stream_audio_input_samples = 0;
+    int64_t                       stream_audio_input_samples = 0;
 
     // ---- incremental streaming state (cache-aware) ----
     //
