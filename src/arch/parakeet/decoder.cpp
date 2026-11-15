@@ -1962,30 +1962,31 @@ struct WindowScorer {
     }
 };
 
-struct ScoredCandidate {
-    VocabularyCandidate c;
-    double              gain = 0.0;
-};
-
 }  // namespace
 
-transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
-                                     const transcribe::Tokenizer & tok,
-                                     const VocabularyBias &        bias,
-                                     const DecodeCapture &         capture,
-                                     int                           n_threads,
-                                     std::vector<TdtToken> &       tokens) {
+transcribe_status choose_vocabulary(const HostDecoderWeights &      w,
+                                    const transcribe::Tokenizer &   tok,
+                                    const VocabularyBias &          bias,
+                                    const DecodeCapture &           capture,
+                                    int                             n_threads,
+                                    const std::vector<TdtToken> &   tokens,
+                                    int                             from_token,
+                                    std::vector<VocabularyChoice> & chosen) {
+    chosen.clear();
     const int64_t joint_h  = w.joint.joint_h;
     const int     n_frames = joint_h > 0 ? static_cast<int>(capture.enc_proj.size() / static_cast<size_t>(joint_h)) : 0;
     if (!bias.active() || tokens.empty() || n_frames <= 0 || capture.checkpoints.empty() ||
         w.head_kind == HostHeadKind::CTC) {
         return TRANSCRIBE_OK;
     }
-    const float *                          enc_proj             = capture.enc_proj.data();
-    const int64_t                          enc_proj_first_frame = capture.enc_proj_first_frame;
-    const int64_t                          t_start              = ggml_time_us();
-    const std::vector<VocabularyWord>      words                = vocabulary_words(tok, tokens);
-    const std::vector<VocabularyCandidate> candidates           = find_vocabulary_candidates(words, bias);
+    const float *               enc_proj             = capture.enc_proj.data();
+    const int64_t               enc_proj_first_frame = capture.enc_proj_first_frame;
+    const int64_t               t_start              = ggml_time_us();
+    std::vector<VocabularyWord> words                = vocabulary_words(tok, tokens);
+    words.erase(std::remove_if(words.begin(), words.end(),
+                               [from_token](const VocabularyWord & word) { return word.first < from_token; }),
+                words.end());
+    const std::vector<VocabularyCandidate> candidates = find_vocabulary_candidates(words, bias);
     if (candidates.empty()) {
         return TRANSCRIBE_OK;
     }
@@ -2033,11 +2034,11 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
         }
     }
 
-    const int64_t                t_replayed = ggml_time_us();
-    const int64_t                last_frame = enc_proj_first_frame + n_frames - 1;
-    std::vector<ScoredCandidate> accepted;
-    int64_t                      joint_columns = 0;
-    int                          scored        = 0;
+    const int64_t                 t_replayed = ggml_time_us();
+    const int64_t                 last_frame = enc_proj_first_frame + n_frames - 1;
+    std::vector<VocabularyChoice> accepted;
+    int64_t                       joint_columns = 0;
+    int                           scored        = 0;
     for (const VocabularyCandidate & c : candidates) {
         const TdtToken & first = tokens[static_cast<size_t>(c.first)];
         const TdtToken & lastk = tokens[static_cast<size_t>(c.end - 1)];
@@ -2111,11 +2112,10 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
 
     // Best gain first; overlapping spans give way.
     std::stable_sort(accepted.begin(), accepted.end(),
-                     [](const ScoredCandidate & a, const ScoredCandidate & b) { return a.gain > b.gain; });
-    std::vector<ScoredCandidate> chosen;
-    for (const ScoredCandidate & a : accepted) {
+                     [](const VocabularyChoice & a, const VocabularyChoice & b) { return a.gain > b.gain; });
+    for (const VocabularyChoice & a : accepted) {
         bool overlaps = false;
-        for (const ScoredCandidate & b : chosen) {
+        for (const VocabularyChoice & b : chosen) {
             overlaps = overlaps || (a.c.first < b.c.end && b.c.first < a.c.end);
         }
         if (!overlaps) {
@@ -2123,49 +2123,67 @@ transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
         }
     }
     std::sort(chosen.begin(), chosen.end(),
-              [](const ScoredCandidate & a, const ScoredCandidate & b) { return a.c.first < b.c.first; });
+              [](const VocabularyChoice & a, const VocabularyChoice & b) { return a.c.first < b.c.first; });
 
-    if (!chosen.empty()) {
-        std::vector<TdtToken> out;
-        out.reserve(tokens.size() + 16);
-        int i = 0;
-        for (const ScoredCandidate & ch : chosen) {
-            for (; i < ch.c.first; ++i) {
-                out.push_back(tokens[static_cast<size_t>(i)]);
-            }
-            const TdtToken & first = tokens[static_cast<size_t>(ch.c.first)];
-            const TdtToken & lastk = tokens[static_cast<size_t>(ch.c.end - 1)];
-            float            p     = 1.0f;
-            for (int k = ch.c.first; k < ch.c.end; ++k) {
-                p = std::min(p, tokens[static_cast<size_t>(k)].p);
-            }
-            const auto & ids  = bias.terms[static_cast<size_t>(ch.c.term)].ids;
-            const int    n    = static_cast<int>(ids.size());
-            const int    span = lastk.step_at_emit - first.step_at_emit;
-            for (int k = 0; k < n; ++k) {
-                TdtToken t;
-                t.id              = ids[static_cast<size_t>(k)];
-                t.p               = p;
-                t.step_at_emit    = first.step_at_emit + (n > 1 ? span * k / (n - 1) : 0);
-                t.duration_frames = (k == n - 1) ? lastk.duration_frames : 1;
-                out.push_back(t);
-            }
-            i = ch.c.end;
-        }
-        for (; i < static_cast<int>(tokens.size()); ++i) {
-            out.push_back(tokens[static_cast<size_t>(i)]);
-        }
-        tokens.swap(out);
-    }
-
-    log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
-            "parakeet vocabulary: %d candidates, %d scored, %d replaced, %lld joint columns, %.1f ms (replay %.1f ms)",
+    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+            "parakeet vocabulary: %d candidates, %d scored, %d chosen, %lld joint columns, %.1f ms (replay %.1f ms)",
             static_cast<int>(candidates.size()), scored, static_cast<int>(chosen.size()),
             static_cast<long long>(joint_columns), (ggml_time_us() - t_start) / 1000.0,
             (t_replayed - t_start) / 1000.0);
     return TRANSCRIBE_OK;
 }
 
+std::vector<TdtToken> apply_vocabulary(const VocabularyBias &                bias,
+                                       const std::vector<TdtToken> &         tokens,
+                                       const std::vector<VocabularyChoice> & chosen) {
+    std::vector<TdtToken> out;
+    out.reserve(tokens.size() + 16);
+    int i = 0;
+    for (const VocabularyChoice & ch : chosen) {
+        for (; i < ch.c.first; ++i) {
+            out.push_back(tokens[static_cast<size_t>(i)]);
+        }
+        const TdtToken & first = tokens[static_cast<size_t>(ch.c.first)];
+        const TdtToken & lastk = tokens[static_cast<size_t>(ch.c.end - 1)];
+        float            p     = 1.0f;
+        for (int k = ch.c.first; k < ch.c.end; ++k) {
+            p = std::min(p, tokens[static_cast<size_t>(k)].p);
+        }
+        const auto & ids  = bias.terms[static_cast<size_t>(ch.c.term)].ids;
+        const int    n    = static_cast<int>(ids.size());
+        const int    span = lastk.step_at_emit - first.step_at_emit;
+        for (int k = 0; k < n; ++k) {
+            TdtToken t;
+            t.id              = ids[static_cast<size_t>(k)];
+            t.p               = p;
+            t.step_at_emit    = first.step_at_emit + (n > 1 ? span * k / (n - 1) : 0);
+            t.duration_frames = (k == n - 1) ? lastk.duration_frames : 1;
+            out.push_back(t);
+        }
+        i = ch.c.end;
+    }
+    for (; i < static_cast<int>(tokens.size()); ++i) {
+        out.push_back(tokens[static_cast<size_t>(i)]);
+    }
+    return out;
+}
+
+transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
+                                     const transcribe::Tokenizer & tok,
+                                     const VocabularyBias &        bias,
+                                     const DecodeCapture &         capture,
+                                     int                           n_threads,
+                                     std::vector<TdtToken> &       tokens) {
+    std::vector<VocabularyChoice> chosen;
+    if (const transcribe_status st = choose_vocabulary(w, tok, bias, capture, n_threads, tokens, 0, chosen);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (!chosen.empty()) {
+        tokens = apply_vocabulary(bias, tokens, chosen);
+    }
+    return TRANSCRIBE_OK;
+}
 
 // ---------------------------------------------------------------------------
 // RNN-T greedy decode with vocabulary-tree branching

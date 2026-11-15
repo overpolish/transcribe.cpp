@@ -122,7 +122,10 @@ TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcri
  * term (or matches one of its sounds_like spellings) is rescored against
  * the term over the same encoder frames, and the term replaces it when its
  * alignment log-probability plus `boost` for each of its pieces is at least
- * the span's. Without this extension the family default boost applies.
+ * the span's. A stream rescores as it goes: its partial result shows each
+ * term as soon as it wins, so its committed text can change where a term
+ * replaces words already committed; finalize decides the words still
+ * being heard. Without this extension the family default boost applies.
  *
  *   boost        Nats added to a term's score per SentencePiece piece of
  *                the term. < 0 selects the family default; 0 turns

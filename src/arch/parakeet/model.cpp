@@ -396,7 +396,9 @@ static transcribe_status begin_stream_vocabulary(ParakeetSession *             p
                                                  const ParakeetModel *         pm,
                                                  const transcribe_run_params * run_params) {
     pc->stream_capture.clear();
-    pc->stream_vocabulary        = VocabularyBias{};
+    pc->stream_vocabulary = VocabularyBias{};
+    pc->stream_vocab_chosen.clear();
+    pc->stream_vocab_frontier    = 0;
     pc->stream_run_params.family = nullptr;
     if (pm->host_decoder.head_kind == HostHeadKind::CTC) {
         return TRANSCRIBE_OK;
@@ -433,33 +435,83 @@ static DecodeCapture * stream_capture_sink(ParakeetSession * pc, const ParakeetM
     return &cap;
 }
 
-// Rescore the finished stream's tokens against its vocabulary. Returns
-// whether the tokens changed.
-static transcribe_status finish_stream_vocabulary(ParakeetSession * pc, const ParakeetModel * pm, bool * changed) {
-    *changed = false;
+// How far behind the audio heard a word's start must be before the spans
+// it is in are decided for good: past a rescoring window's tail and the
+// token after it, so more audio cannot change their score.
+constexpr int64_t k_stream_vocab_settle_frames = 24;  // 1.9 s at 80 ms
+
+// The terms chosen for the stream's spans not yet decided for good, from
+// stream_vocab_frontier on. Without a vocabulary, or should rescoring fail,
+// none: the words stand as heard.
+static std::vector<VocabularyChoice> choose_stream_vocabulary(ParakeetSession * pc, const ParakeetModel * pm) {
+    std::vector<VocabularyChoice> chosen;
     if (!pc->stream_vocabulary.active() || pc->stream_capture.enc_proj.empty()) {
-        return TRANSCRIBE_OK;
+        return chosen;
     }
-    const auto           before = pc->raw_tokens.size();
-    std::vector<int32_t> ids_before;
-    for (const auto & t : pc->raw_tokens) {
-        ids_before.push_back(t.id);
+    if (choose_vocabulary(pm->host_decoder, pm->tok, pc->stream_vocabulary, pc->stream_capture, pc->n_threads,
+                          pc->raw_tokens, pc->stream_vocab_frontier, chosen) != TRANSCRIBE_OK) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "parakeet vocabulary: could not rescore the stream's latest words");
+        chosen.clear();
     }
-    const transcribe_status st = rescore_vocabulary(pm->host_decoder, pm->tok, pc->stream_vocabulary,
-                                                    pc->stream_capture, pc->n_threads, pc->raw_tokens);
-    if (st != TRANSCRIBE_OK) {
-        return st;
+    return chosen;
+}
+
+// The tokens a running stream's partial result shows: raw_tokens with each
+// term chosen so far, so a listed word reads right as soon as it is heard
+// rather than only once the stream finishes. Spans every word of which was
+// heard long enough ago are decided for good and not scored again; the
+// frontier stays far enough back that no span still being heard starts
+// before it.
+static const std::vector<TdtToken> & show_stream_vocabulary(ParakeetSession * pc, const ParakeetModel * pm) {
+    if (!pc->stream_vocabulary.active() || pc->stream_capture.enc_proj.empty()) {
+        return pc->raw_tokens;
     }
-    if (pc->raw_tokens.size() != before) {
-        *changed = true;
-    } else {
-        for (size_t i = 0; i < before; ++i) {
-            if (pc->raw_tokens[i].id != ids_before[i]) {
-                *changed = true;
-                break;
-            }
+    const std::vector<VocabularyChoice> latest = choose_stream_vocabulary(pc, pm);
+
+    const size_t  joint_h = static_cast<size_t>(std::max<int64_t>(pm->host_decoder.joint.joint_h, 1));
+    const int64_t heard =
+        pc->stream_capture.enc_proj_first_frame + static_cast<int64_t>(pc->stream_capture.enc_proj.size() / joint_h);
+    const std::vector<VocabularyWord> words = vocabulary_words(pm->tok, pc->raw_tokens);
+    int                               open  = static_cast<int>(words.size());  // first word still being heard
+    for (int k = 0; k < static_cast<int>(words.size()); ++k) {
+        const TdtToken & first = pc->raw_tokens[static_cast<size_t>(words[static_cast<size_t>(k)].first)];
+        if (first.step_at_emit > heard - k_stream_vocab_settle_frames) {
+            open = k;
+            break;
         }
     }
+    const int first_open = std::max(open - (k_vocab_max_span_words - 1), 0);
+    int       frontier   = first_open < static_cast<int>(words.size()) ? words[static_cast<size_t>(first_open)].first :
+                                                                         static_cast<int>(pc->raw_tokens.size());
+    frontier             = std::max(frontier, pc->stream_vocab_frontier);
+
+    std::vector<VocabularyChoice> shown = pc->stream_vocab_chosen;
+    for (const VocabularyChoice & choice : latest) {
+        if (choice.c.first < frontier) {
+            pc->stream_vocab_chosen.push_back(choice);
+            frontier = std::max(frontier, choice.c.end);
+        }
+        shown.push_back(choice);
+    }
+    pc->stream_vocab_frontier = frontier;
+    pc->stream_shown          = apply_vocabulary(pc->stream_vocabulary, pc->raw_tokens, shown);
+    return pc->stream_shown;
+}
+
+// Rescore what the finished stream has not yet decided, and write every
+// term chosen into its tokens. Returns whether the tokens changed.
+static transcribe_status finish_stream_vocabulary(ParakeetSession * pc, const ParakeetModel * pm, bool * changed) {
+    std::vector<VocabularyChoice> chosen = std::move(pc->stream_vocab_chosen);
+    for (const VocabularyChoice & choice : choose_stream_vocabulary(pc, pm)) {
+        chosen.push_back(choice);
+    }
+    *changed = !chosen.empty();
+    if (*changed) {
+        pc->raw_tokens = apply_vocabulary(pc->stream_vocabulary, pc->raw_tokens, chosen);
+    }
+    pc->stream_vocab_chosen.clear();
+    pc->stream_vocab_frontier = 0;
+    pc->stream_shown.clear();
     pc->stream_capture.clear();
     return TRANSCRIBE_OK;
 }
@@ -2911,18 +2963,22 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
 
 namespace {
 
-// Rebuild the public result vectors (tokens, full_text) from the
-// committed raw_tokens; idempotent. Words/segments are NOT populated
+// Rebuild the public result vectors (tokens, full_text) from `shown`: the
+// committed raw_tokens, or while a stream with a vocabulary runs, those
+// tokens with the terms chosen so far (show_stream_vocabulary); idempotent.
+// raw_text stays the tokens as heard. Words/segments are NOT populated
 // during streaming (deferred to finalize). result_kind is TOKEN whenever
 // tokens are present — each gets real t0/t1 from step_at_emit, the
 // strongest honest answer at this granularity.
-void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * pm) {
+void rebuild_streaming_result_text(ParakeetSession *             pc,
+                                   const ParakeetModel *         pm,
+                                   const std::vector<TdtToken> & shown) {
     pc->tokens.clear();
     pc->words.clear();
     pc->segments.clear();
     pc->full_text.clear();
 
-    if (pc->raw_tokens.empty()) {
+    if (shown.empty()) {
         pc->has_result  = false;
         pc->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
         return;
@@ -2936,10 +2992,10 @@ void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * p
     const transcribe::Tokenizer & tok        = pm->tok;
     const bool                    strip_tags = !pc->stream_run_params.keep_special_tags;
 
-    pc->tokens.reserve(pc->raw_tokens.size());
+    pc->tokens.reserve(shown.size());
     std::vector<int32_t> all_ids;
-    all_ids.reserve(pc->raw_tokens.size());
-    for (const auto & tk : pc->raw_tokens) {
+    all_ids.reserve(shown.size());
+    for (const auto & tk : shown) {
         if (strip_tags && is_strippable_special(tok, tk.id)) {
             continue;
         }
@@ -3689,7 +3745,7 @@ transcribe_status stream_feed(transcribe_session *       session,
         }
         const bool tokens_changed = static_cast<int>(pc->raw_tokens.size()) != prev_n_tokens;
         if (tokens_changed) {
-            rebuild_streaming_result_text(pc, pm);
+            rebuild_streaming_result_text(pc, pm, show_stream_vocabulary(pc, pm));
             pc->n_committed_tokens   = static_cast<int>(pc->tokens.size());
             pc->n_committed_words    = 0;
             pc->n_committed_segments = 0;
@@ -3817,7 +3873,7 @@ transcribe_status stream_feed(transcribe_session *       session,
     // Rebuild the partial transcript from committed tokens.
     const bool tokens_changed = static_cast<int>(pc->raw_tokens.size()) != prev_n_tokens;
     if (tokens_changed) {
-        rebuild_streaming_result_text(pc, pm);
+        rebuild_streaming_result_text(pc, pm, show_stream_vocabulary(pc, pm));
         pc->n_committed_tokens   = static_cast<int>(pc->tokens.size());
         pc->n_committed_words    = 0;
         pc->n_committed_segments = 0;
@@ -3900,7 +3956,7 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
         }
         const bool tokens_changed = rescored || static_cast<int>(pc->raw_tokens.size()) != prev_n_tokens;
         if (tokens_changed || !pc->has_result) {
-            rebuild_streaming_result_text(pc, pm);
+            rebuild_streaming_result_text(pc, pm, pc->raw_tokens);
         }
         pc->stream_audio_committed_us = pc->stream_audio_input_us;
         pc->n_committed_tokens        = static_cast<int>(pc->tokens.size());
@@ -3985,7 +4041,7 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
     }
     const bool tokens_changed = rescored || static_cast<int>(pc->raw_tokens.size()) != prev_n_tokens;
     if (tokens_changed || !pc->has_result) {
-        rebuild_streaming_result_text(pc, pm);
+        rebuild_streaming_result_text(pc, pm, pc->raw_tokens);
     }
 
     // Commit everything: at finalize all emitted tokens are final.
