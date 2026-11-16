@@ -71,6 +71,7 @@ add_library(transcribe
     arch/sortformer/model.cpp
     arch/sortformer/stream.cpp
     arch/sortformer/weights.cpp
+    arch/sortformer/v3.cpp
     arch/ecapa_tdnn/graph.cpp
     arch/ecapa_tdnn/model.cpp
     arch/ecapa_tdnn/weights.cpp

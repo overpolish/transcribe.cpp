@@ -23,9 +23,15 @@ struct ggml_tensor;
 namespace transcribe::sortformer {
 
 struct SortformerHParams {
+    // Model generation: 2 is the FastConformer + Transformer diarizer
+    // (diar_streaming_sortformer_4spk-v2*); 3 is the high-resolution
+    // Nemotron 3 Diarization (stacked mel -> RoPE Transformer -> 10 ms
+    // sub-pixel upsampling, learned silence embedding).
+    int32_t version = 2;
+
     // Diarization.
     int32_t max_speakers = 4;  // hard architectural cap
-    int32_t frame_hop    = 0;  // samples per diar frame (hop * subsampling)
+    int32_t frame_hop    = 0;  // samples per output frame
 
     // Conformer encoder (mirrors the parakeet fields; see convert KVs).
     int32_t     enc_n_layers             = 0;
@@ -58,14 +64,40 @@ struct SortformerHParams {
     float       fe_dither       = 0.0f;
     float       fe_pre_emphasis = 0.0f;
 
-    // Shipped streaming defaults (deferred streaming path; read for KV
-    // completeness and later use).
+    // Shipped streaming defaults (the operating point used when no preset
+    // is asked for).
     int32_t stream_chunk_len              = 0;
+    int32_t stream_chunk_right_context    = 1;
     int32_t stream_spkcache_len           = 0;
     int32_t stream_fifo_len               = 0;
     int32_t stream_spkcache_update_period = 0;
+    int32_t stream_sil_frames_per_spk     = 3;
 
+    // v3 only: the RoPE encoder and the output upsampling. tf_d_model is
+    // the head width (192) and tf_n_layers 0, as v3 has no post Transformer.
+    float   enc_rope_base       = 10000.0f;
+    float   enc_rotary_fraction = 1.0f;
+    int32_t upsample_factor     = 1;  // output frames per encoder frame
+
+    bool    is_v3() const { return version == 3; }
     int32_t tf_head_dim() const { return tf_n_heads > 0 ? tf_d_model / tf_n_heads : 0; }
+};
+
+// One pre-LN RoPE Transformer block of the v3 encoder. Q/K/V are one
+// bias-free projection (q, then k, then v); the output projection and both
+// FFN linears carry bias; the FFN is GELU.
+struct SortformerRopeBlock {
+    ggml_tensor * norm1_w    = nullptr;  // [d]
+    ggml_tensor * norm1_b    = nullptr;  // [d]
+    ggml_tensor * attn_qkv_w = nullptr;  // [d, 3d]
+    ggml_tensor * attn_o_w   = nullptr;  // [d, d]
+    ggml_tensor * attn_o_b   = nullptr;  // [d]
+    ggml_tensor * norm2_w  = nullptr;  // [d]
+    ggml_tensor * norm2_b  = nullptr;  // [d]
+    ggml_tensor * ff_in_w  = nullptr;  // [d, d_ff]
+    ggml_tensor * ff_in_b  = nullptr;  // [d_ff]
+    ggml_tensor * ff_out_w = nullptr;  // [d_ff, d]
+    ggml_tensor * ff_out_b = nullptr;  // [d]
 };
 
 // One post-LN Transformer encoder block. All linears carry bias.
@@ -100,9 +132,22 @@ struct SortformerWeights {
     ggml_tensor * fc1_b             = nullptr;  // [tf_d_model]
     ggml_tensor * single_spk_head_w = nullptr;  // [tf_d_model, max_speakers]
     ggml_tensor * single_spk_head_b = nullptr;  // [max_speakers]
-    // Streaming 2*hidden head (spkcache concat path); loaded but unused offline.
+    // v2 streaming 2*hidden head (spkcache concat path); loaded but unused.
     ggml_tensor * spk_head_w        = nullptr;  // [2*tf_d_model, max_speakers]
     ggml_tensor * spk_head_b        = nullptr;  // [max_speakers]
+
+    // v3 encoder: frame stacking projection, RoPE blocks between two norms.
+    ggml_tensor *                    stack_proj_w   = nullptr;  // [feat_in*sub, enc_d_model]
+    ggml_tensor *                    norm_embed_w   = nullptr;  // [enc_d_model]
+    ggml_tensor *                    norm_embed_b   = nullptr;
+    std::vector<SortformerRopeBlock> rope_blocks;               // enc_n_layers entries
+    ggml_tensor *                    final_norm_w   = nullptr;  // [enc_d_model]
+    ggml_tensor *                    final_norm_b   = nullptr;
+    // v3 sub-pixel upsampling Conv1d (tf_d_model -> upsample * tf_d_model).
+    ggml_tensor *                    upsample_w     = nullptr;  // [3, tf_d_model, upsample*tf_d_model]
+    ggml_tensor *                    upsample_b     = nullptr;  // [upsample*tf_d_model]
+    // v3 learned silence embedding the speaker cache pads with.
+    ggml_tensor *                    silence_emb    = nullptr;  // [enc_d_model]
 };
 
 // Read every required stt.sortformer.* / stt.frontend.* KV into hp.

@@ -567,10 +567,13 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return TRANSCRIBE_ERR_GGUF;
     }
 
-    if (const transcribe_status st = load_conformer_weights(m->ctx_meta, m->conformer_hp, m->conformer);
-        st != TRANSCRIBE_OK) {
-        gguf_free(gguf_data);
-        return st;
+    // v3 has no FastConformer; its encoder lives in SortformerWeights.
+    if (!m->hparams.is_v3()) {
+        if (const transcribe_status st = load_conformer_weights(m->ctx_meta, m->conformer_hp, m->conformer);
+            st != TRANSCRIBE_OK) {
+            gguf_free(gguf_data);
+            return st;
+        }
     }
     if (const transcribe_status st = build_sortformer_weights(m->ctx_meta, m->hparams, m->weights);
         st != TRANSCRIBE_OK) {
@@ -755,7 +758,18 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
     if (sub <= 0 || P.chunk_len <= 0 || sched == nullptr || mel_buf == nullptr) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    sc.stream.reset(ed);
+    if (hp.is_v3()) {
+        // The learned silence embedding is a model constant: read it once.
+        if (sc.silence_host.size() != static_cast<size_t>(ed)) {
+            sc.silence_host.resize(static_cast<size_t>(ed));
+            ggml_backend_tensor_get(w.silence_emb, sc.silence_host.data(), 0, sc.silence_host.size() * sizeof(float));
+        }
+        sc.stream.reset(ed, &sc.silence_host);
+        sc.native_preds.clear();
+        sc.native_n = 0;
+    } else {
+        sc.stream.reset(ed);
+    }
 
     const bool external_cadence = P.feat_first_chunk > 0;
     if (external_cadence && (P.chunk_left_context != 0 || P.chunk_right_context != 0)) {
@@ -812,14 +826,6 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
         ggml_context * ctx = sc.compute_ctx;
         transcribe::debug::push_name_prefix("stream.chunk");
 
-        // ---- Graph A: pre_encode over the mel window ----
-        PreEncodeBuild A = build_pre_encode_graph(ctx, chp, conformer.pre_encode, backend, M);
-        if (A.graph == nullptr) {
-            transcribe::debug::pop_name_prefix();
-            return TRANSCRIBE_ERR_GGUF;
-        }
-        int T_diar = static_cast<int>(A.out->ne[1]);
-
         // Mel window [n_mels, M] from full mel [n_mels, feat_len], cols
         // [win_lo, win_hi). ggml ne=[M, n_mels] -> offset mel*M + col.
         sc.chunk_mel_buf.resize(static_cast<size_t>(mel_n_mels) * M);
@@ -828,20 +834,42 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
             std::copy(src, src + M, sc.chunk_mel_buf.data() + static_cast<size_t>(mel) * M);
         }
 
+        // ---- Graph A: per-frame embeddings over the mel window (v2:
+        // pre_encode; v3: stacked frames through one projection) ----
+        ggml_cgraph * graph_a = nullptr;
+        ggml_tensor * a_in    = nullptr;
+        ggml_tensor * a_out   = nullptr;
+        if (hp.is_v3()) {
+            const V3StackBuild A = build_v3_stack_graph(ctx, hp, w, M);
+            graph_a              = A.graph;
+            a_in                 = A.mel_in;
+            a_out                = A.out;
+        } else {
+            const PreEncodeBuild A = build_pre_encode_graph(ctx, chp, conformer.pre_encode, backend, M);
+            graph_a                = A.graph;
+            a_in                   = A.mel_in;
+            a_out                  = A.out;
+        }
+        if (graph_a == nullptr) {
+            transcribe::debug::pop_name_prefix();
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        int T_diar = static_cast<int>(a_out->ne[1]);
+
         ggml_backend_sched_reset(sched);
-        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, A.graph, "sortformer")) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, graph_a, "sortformer")) {
             transcribe::debug::pop_name_prefix();
             return TRANSCRIBE_ERR_OOM;
         }
-        ggml_backend_tensor_set(A.mel_in, sc.chunk_mel_buf.data(), 0, sc.chunk_mel_buf.size() * sizeof(float));
+        ggml_backend_tensor_set(a_in, sc.chunk_mel_buf.data(), 0, sc.chunk_mel_buf.size() * sizeof(float));
         transcribe::configure_sched_n_threads(sched, n_threads);
-        if (ggml_backend_sched_graph_compute(sched, A.graph) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(sched, graph_a) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sortformer streaming: pre_encode compute failed");
             transcribe::debug::pop_name_prefix();
             return TRANSCRIBE_ERR_BACKEND;
         }
         sc.chunk_embs_host.resize(static_cast<size_t>(T_diar) * ed);
-        ggml_backend_tensor_get(A.out, sc.chunk_embs_host.data(), 0, sc.chunk_embs_host.size() * sizeof(float));
+        ggml_backend_tensor_get(a_out, sc.chunk_embs_host.data(), 0, sc.chunk_embs_host.size() * sizeof(float));
 
         // External cadence: discard the duplicated / partially-contexted
         // pre-encode outputs (NeMo drop_extra_pre_encoded, applied right
@@ -871,35 +899,89 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
         std::copy(sc.chunk_embs_host.begin(), sc.chunk_embs_host.end(),
                   sc.concat_host.begin() + static_cast<size_t>(S + F) * ed);
 
-        // ---- Graph B: xscale + 17 blocks + proj + 18 tf + head ----
-        StreamInferBuild B = build_stream_infer_graph(ctx, hp, chp, conformer, w, backend, T_concat);
-        if (B.graph == nullptr) {
+        // ---- Graph B over the concat (v2: xscale + 17 conformer blocks +
+        // proj + 18 tf + head; v3: RoPE encoder + proj + upsample + head) ----
+        ggml_cgraph * graph_b = nullptr;
+        ggml_tensor * b_in    = nullptr;
+        ggml_tensor * b_aux   = nullptr;  // v2 rel-pos table, v3 positions
+        ggml_tensor * b_preds = nullptr;
+        if (hp.is_v3()) {
+            const V3InferBuild B = build_v3_infer_graph(ctx, hp, w, T_concat);
+            graph_b              = B.graph;
+            b_in                 = B.concat_in;
+            b_aux                = B.positions;
+            b_preds              = B.preds;
+            sc.positions.resize(static_cast<size_t>(T_concat));
+            for (int i = 0; i < T_concat; ++i) {
+                sc.positions[static_cast<size_t>(i)] = i;
+            }
+        } else {
+            const StreamInferBuild B = build_stream_infer_graph(ctx, hp, chp, conformer, w, backend, T_concat);
+            graph_b                  = B.graph;
+            b_in                     = B.concat_in;
+            b_aux                    = B.pos_emb_in;
+            b_preds                  = B.preds;
+            fill_rel_pos_emb(sc.pos_buf, sc.pos_div_term, 2 * T_concat - 1, ed);
+        }
+        if (graph_b == nullptr) {
             transcribe::debug::pop_name_prefix();
             return TRANSCRIBE_ERR_GGUF;
         }
-        fill_rel_pos_emb(sc.pos_buf, sc.pos_div_term, 2 * T_concat - 1, ed);
 
         ggml_backend_sched_reset(sched);
-        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, B.graph, "sortformer")) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, graph_b, "sortformer")) {
             transcribe::debug::pop_name_prefix();
             return TRANSCRIBE_ERR_OOM;
         }
-        ggml_backend_tensor_set(B.concat_in, sc.concat_host.data(), 0, sc.concat_host.size() * sizeof(float));
-        ggml_backend_tensor_set(B.pos_emb_in, sc.pos_buf.data(), 0, sc.pos_buf.size() * sizeof(float));
+        ggml_backend_tensor_set(b_in, sc.concat_host.data(), 0, sc.concat_host.size() * sizeof(float));
+        if (hp.is_v3()) {
+            ggml_backend_tensor_set(b_aux, sc.positions.data(), 0, sc.positions.size() * sizeof(int32_t));
+        } else {
+            ggml_backend_tensor_set(b_aux, sc.pos_buf.data(), 0, sc.pos_buf.size() * sizeof(float));
+        }
         transcribe::configure_sched_n_threads(sched, n_threads);
-        if (ggml_backend_sched_graph_compute(sched, B.graph) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(sched, graph_b) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sortformer streaming: infer compute failed");
             transcribe::debug::pop_name_prefix();
             return TRANSCRIBE_ERR_BACKEND;
         }
         sc.stream_preds_host.resize(static_cast<size_t>(T_concat) * n_spk);
-        ggml_backend_tensor_get(B.preds, sc.stream_preds_host.data(), 0, sc.stream_preds_host.size() * sizeof(float));
+        if (hp.is_v3()) {
+            // The speaker cache scores encoder frames: each is the mean of
+            // its `up` 10 ms predictions.
+            const int up = hp.upsample_factor;
+            sc.native_host.resize(static_cast<size_t>(T_concat) * up * n_spk);
+            ggml_backend_tensor_get(b_preds, sc.native_host.data(), 0, sc.native_host.size() * sizeof(float));
+            for (int f = 0; f < T_concat; ++f) {
+                for (int s = 0; s < n_spk; ++s) {
+                    float sum = 0.0f;
+                    for (int u = 0; u < up; ++u) {
+                        sum += sc.native_host[(static_cast<size_t>(f) * up + u) * n_spk + s];
+                    }
+                    sc.stream_preds_host[static_cast<size_t>(f) * n_spk + s] = sum / static_cast<float>(up);
+                }
+            }
+        } else {
+            ggml_backend_tensor_get(b_preds, sc.stream_preds_host.data(), 0,
+                                    sc.stream_preds_host.size() * sizeof(float));
+        }
 
         transcribe::debug::pop_name_prefix();
 
         // ---- host streaming update (FIFO + AOSC compress) ----
         streaming_update_sync(sc.stream, P, n_spk, ed, sc.chunk_embs_host, T_diar, sc.stream_preds_host, T_concat, lc,
                               rc);
+
+        // v3 output: the chunk's own frames on the 10 ms grid.
+        if (hp.is_v3()) {
+            const int    up    = hp.upsample_factor;
+            const int    C     = T_diar - lc - rc;
+            const size_t first = static_cast<size_t>(S + F + lc) * up * n_spk;
+            sc.native_preds.insert(sc.native_preds.end(), sc.native_host.begin() + static_cast<std::ptrdiff_t>(first),
+                                   sc.native_host.begin() +
+                                       static_cast<std::ptrdiff_t>(first + static_cast<size_t>(C) * up * n_spk));
+            sc.native_n += C * up;
+        }
 
         stt = end;
         ++chunk_idx;
@@ -931,20 +1013,22 @@ static transcribe_status run_streaming(SortformerSession *          pc,
     }
     pc->t_encode_us = ggml_time_us() - t_stream_start;
 
-    // Trim padding tail: NeMo total_preds[:, :ceil(feat_len/sub)].
-    const int sub      = pm->hparams.enc_subsampling_factor;
-    const int n_spk    = pm->hparams.max_speakers;
-    const int n_frames = (mel_n_frames + sub - 1) / sub;
-    const int used_n   = std::min(pc->scratch.stream.total_n, n_frames);
+    // Trim padding tail: NeMo total_preds[:, :ceil(feat_len/sub)]; v3
+    // predicts on the mel grid itself, so its valid frames are the mel's.
+    const int                  sub      = pm->hparams.enc_subsampling_factor;
+    const int                  n_spk    = pm->hparams.max_speakers;
+    const bool                 v3       = pm->hparams.is_v3();
+    const std::vector<float> & preds    = v3 ? pc->scratch.native_preds : pc->scratch.stream.total_preds;
+    const int                  n_frames = v3 ? mel_n_frames : (mel_n_frames + sub - 1) / sub;
+    const int used_n = std::min(v3 ? pc->scratch.native_n : pc->scratch.stream.total_n, n_frames);
 
     if (transcribe::debug::enabled()) {
         const long long shape[2] = { used_n, n_spk };
-        transcribe::debug::dump_host_f32("diar.probs", pc->scratch.stream.total_preds.data(),
-                                         static_cast<long long>(used_n) * n_spk, shape, 2, "diarize");
+        transcribe::debug::dump_host_f32("diar.probs", preds.data(), static_cast<long long>(used_n) * n_spk, shape, 2,
+                                         "diarize");
     }
 
-    out.probs.assign(pc->scratch.stream.total_preds.begin(),
-                     pc->scratch.stream.total_preds.begin() + static_cast<size_t>(used_n) * n_spk);
+    out.probs.assign(preds.begin(), preds.begin() + static_cast<size_t>(used_n) * n_spk);
     out.n_frames   = used_n;
     out.n_speakers = n_spk;
     out.frame_ms   = ms_per_frame;
@@ -978,7 +1062,9 @@ static transcribe_status diarize_pcm(SortformerSession *          pc,
     // attention over the WHOLE clip — fine for the short oracle, but it would
     // OOM on the many-minute audio the DER runner feeds (which also enables
     // dumping, to read diar.probs). The streaming path is always the product.
-    if (transcribe::debug::enabled() && std::getenv("TRANSCRIBE_SORTFORMER_OFFLINE_DUMP") != nullptr) {
+    // v2 only: it runs the FastConformer, which v3 does not have.
+    if (!pm->hparams.is_v3() && transcribe::debug::enabled() &&
+        std::getenv("TRANSCRIBE_SORTFORMER_OFFLINE_DUMP") != nullptr) {
         if (const transcribe_status st = run_offline_forward(pc, pm, mel_n_frames); st != TRANSCRIBE_OK) {
             return st;
         }

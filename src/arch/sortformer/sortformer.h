@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 struct ggml_backend;
@@ -116,20 +117,28 @@ struct SortformerStreamState {
     std::vector<float> fifo_preds;                   // [fifo_n * S]
     int                fifo_n = 0;
     std::vector<float> mean_sil_emb;                 // [D]
-    int64_t            n_sil_frames = 0;
+    int64_t            n_sil_frames    = 0;
+    bool               learned_silence = false;      // v3: mean_sil_emb is fixed, never re-averaged
     std::vector<float> total_preds;                  // [T_total * S], accumulated chunk preds
     int                total_n        = 0;
     int                compress_count = 0;           // # _compress_spkcache calls (parity-dump index)
 
-    void reset(int emb_dim) {
+    // `learned` (nullable) is v3's learned silence embedding, [emb_dim];
+    // without it the silence profile is the running mean of quiet frames.
+    void reset(int emb_dim, const std::vector<float> * learned = nullptr) {
         spkcache.clear();
         spkcache_preds.clear();
         spkcache_n          = 0;
         spkcache_preds_init = false;
         fifo.clear();
         fifo_preds.clear();
-        fifo_n = 0;
-        mean_sil_emb.assign(static_cast<size_t>(emb_dim), 0.0f);
+        fifo_n          = 0;
+        learned_silence = learned != nullptr;
+        if (learned_silence) {
+            mean_sil_emb = *learned;
+        } else {
+            mean_sil_emb.assign(static_cast<size_t>(emb_dim), 0.0f);
+        }
         n_sil_frames = 0;
         total_preds.clear();
         total_n        = 0;
@@ -178,6 +187,16 @@ struct DiarStreamScratch {
     std::vector<float>    concat_host;        // [T_concat * enc_d_model] Graph B input
     std::vector<float>    stream_preds_host;  // [T_concat * n_spk] Graph B readback
 
+    // v3: Graph B predicts on the 10 ms mel grid. native_host is its
+    // readback ([T_concat * up * n_spk]); stream_preds_host then holds the
+    // per-encoder-frame mean the speaker cache scores, and native_preds
+    // accumulates each chunk's 10 ms predictions as the output.
+    std::vector<float>   native_host;
+    std::vector<float>   native_preds;
+    int                  native_n = 0;
+    std::vector<int32_t> positions;     // RoPE positions 0..T_concat-1
+    std::vector<float>   silence_host;  // learned silence embedding, read once
+
     DiarStreamScratch() = default;
     ~DiarStreamScratch();
 };
@@ -193,6 +212,30 @@ struct SortformerSession final : public transcribe_diarize_session {
     // offline forward's pos_emb fill).
     DiarStreamScratch scratch;
 };
+
+// ---- v3 (Nemotron 3 Diarization) graphs; defined in v3.cpp ---------- //
+
+// Graph A: mel window [M, n_mels] -> stacked-frame embeddings
+// [enc_d_model, ceil(M / sub)].
+struct V3StackBuild {
+    ggml_cgraph * graph  = nullptr;
+    ggml_tensor * mel_in = nullptr;
+    ggml_tensor * out    = nullptr;
+};
+V3StackBuild build_v3_stack_graph(ggml_context * ctx, const SortformerHParams & hp, const SortformerWeights & w, int M);
+
+// Graph B: [enc_d_model, T_concat] embeddings + RoPE positions -> 10 ms
+// speaker probabilities [n_spk, T_concat * upsample_factor].
+struct V3InferBuild {
+    ggml_cgraph * graph     = nullptr;
+    ggml_tensor * concat_in = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * preds     = nullptr;
+};
+V3InferBuild build_v3_infer_graph(ggml_context *            ctx,
+                                  const SortformerHParams & hp,
+                                  const SortformerWeights & w,
+                                  int                       T_concat);
 
 // ---- Embedded-diarizer surface (multitalker bundle) -------------------- //
 //

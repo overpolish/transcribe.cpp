@@ -15,6 +15,7 @@
 #include "weights.h"
 
 #include <algorithm>
+#include <iterator>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -72,6 +73,16 @@ const Preset k_presets[] = {
     { "small",             20,  1,  10,  20,  24  },
 };
 
+// Nemotron 3 Diarization (v3) operating points: the model card's
+// "very high latency (offline)" and "low latency" rows, and NeMo-Speech.cpp's
+// v3-offline geometry between them. The speaker cache holds 264 frames.
+const Preset k_presets_v3[] = {
+    { "very_high_latency", 340, 40, 40,  300, 264 },
+    { "high_latency",      264, 1,  0,   188, 264 },
+    { "low_latency",       9,   4,  264, 222, 264 },
+    { "small",             20,  1,  10,  20,  24  },
+};
+
 }  // namespace
 
 SortformerStreamParams resolve_stream_params(const SortformerHParams & hp, transcribe_sortformer_preset preset) {
@@ -82,48 +93,44 @@ SortformerStreamParams resolve_stream_params(const SortformerHParams & hp, trans
     p.fifo_len     = hp.stream_fifo_len;  // 0 is a valid shipped value
     p.spkcache_update_period =
         hp.stream_spkcache_update_period > 0 ? hp.stream_spkcache_update_period : p.spkcache_update_period;
+    p.chunk_right_context         = hp.stream_chunk_right_context;
+    p.spkcache_sil_frames_per_spk = hp.stream_sil_frames_per_spk;
 
-    // Public diarize-ext preset (DEFAULT keeps the GGUF cfg). Range-checked by
-    // diarize_run_validate before the dispatcher clears the previous result.
-    const char * ext_name = nullptr;
-    switch (preset) {
-        case TRANSCRIBE_SORTFORMER_PRESET_DEFAULT:
-            break;
-        case TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY:
-            ext_name = "very_high_latency";
-            break;
-        case TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY:
-            ext_name = "high_latency";
-            break;
-        case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
-            ext_name = "low_latency";
-            break;
-    }
-    if (ext_name != nullptr) {
-        for (const Preset & pr : k_presets) {
-            if (std::string(ext_name) == pr.name) {
-                p.chunk_len              = pr.chunk_len;
-                p.chunk_right_context    = pr.chunk_right_context;
-                p.fifo_len               = pr.fifo_len;
-                p.spkcache_update_period = pr.spkcache_update_period;
-                p.spkcache_len           = pr.spkcache_len;
-                break;
-            }
-        }
-    }
-
-    // Named preset env override (validation / DER operating point).
-    if (const char * name = env_get("TRANSCRIBE_SORTFORMER_STREAM_PRESET")) {
-        for (const Preset & pr : k_presets) {
+    static_assert(std::size(k_presets) == std::size(k_presets_v3), "one preset table per generation");
+    const Preset * table = hp.is_v3() ? k_presets_v3 : k_presets;
+    const auto     apply = [&](const char * name) {
+        for (size_t i = 0; i < std::size(k_presets); ++i) {
+            const Preset & pr = table[i];
             if (std::string(name) == pr.name) {
                 p.chunk_len              = pr.chunk_len;
                 p.chunk_right_context    = pr.chunk_right_context;
                 p.fifo_len               = pr.fifo_len;
                 p.spkcache_update_period = pr.spkcache_update_period;
                 p.spkcache_len           = pr.spkcache_len;
-                break;
+                return;
             }
         }
+    };
+
+    // Public diarize-ext preset (DEFAULT keeps the GGUF cfg). Range-checked by
+    // diarize_run_validate before the dispatcher clears the previous result.
+    switch (preset) {
+        case TRANSCRIBE_SORTFORMER_PRESET_DEFAULT:
+            break;
+        case TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY:
+            apply("very_high_latency");
+            break;
+        case TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY:
+            apply("high_latency");
+            break;
+        case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
+            apply("low_latency");
+            break;
+    }
+
+    // Named preset env override (validation / DER operating point).
+    if (const char * name = env_get("TRANSCRIBE_SORTFORMER_STREAM_PRESET")) {
+        apply(name);
     }
 
     // Per-field env overrides (highest precedence).
@@ -442,7 +449,9 @@ void streaming_update_sync(SortformerStreamState &        st,
         std::vector<float> pop_embs(st.fifo.begin(), st.fifo.begin() + static_cast<size_t>(pop) * emb_dim);
         std::vector<float> pop_preds(st.fifo_preds.begin(), st.fifo_preds.begin() + static_cast<size_t>(pop) * n_spk);
 
-        get_silence_profile(st, p.sil_threshold, pop_embs.data(), pop_preds.data(), pop, n_spk, emb_dim);
+        if (!st.learned_silence) {
+            get_silence_profile(st, p.sil_threshold, pop_embs.data(), pop_preds.data(), pop, n_spk, emb_dim);
+        }
 
         // fifo = fifo[pop:].
         st.fifo.erase(st.fifo.begin(), st.fifo.begin() + static_cast<size_t>(pop) * emb_dim);
